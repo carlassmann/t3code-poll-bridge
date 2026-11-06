@@ -1,0 +1,10 @@
+{
+  "name": "t3code-poll-bridge",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node bridge.ts",
+    "pair": "node bridge.ts pair"
+  }
+}

@@ -1,0 +1,12 @@
+[Unit]
+Description=Cloudflare tunnel for t3code-poll-bridge
+After=network-online.target t3code-poll-bridge.service
+Wants=t3code-poll-bridge.service
+
+[Service]
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --config %h/.cloudflared/t3code-poll-bridge.yml run t3code-poll-bridge
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

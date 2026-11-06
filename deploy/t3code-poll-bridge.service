@@ -1,0 +1,15 @@
+[Unit]
+Description=T3 Code poll bridge
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/t3code-poll-bridge
+Environment=T3_UPSTREAM=http://127.0.0.1:3773
+Environment=PORT=3781
+Environment=PUBLIC_HOSTS=t3.example.com
+ExecStart=/usr/bin/env node bridge.ts
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
