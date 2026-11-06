@@ -22,6 +22,10 @@ const PUBLIC_HOSTS = new Set(
     .filter(Boolean),
 );
 
+const ACCESS_TEAM_DOMAIN = process.env.CF_ACCESS_TEAM_DOMAIN;
+const ACCESS_AUD = process.env.CF_ACCESS_AUD;
+const ACCESS_KEYS_MIN_REFRESH_MS = 60_000;
+
 const SHIM_PATH = "/__t3code-poll-bridge/poll-websocket.js";
 const SHIM_SOURCE = readFileSync(new URL("./poll-websocket.js", import.meta.url));
 const POLL_PATH = "/ws/poll";
@@ -70,12 +74,73 @@ function isAllowedHost(request: IncomingMessage): boolean {
   return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || PUBLIC_HOSTS.has(host);
 }
 
-// Blocks cross-site requests and DNS rebinding; authentication is Cloudflare Access's job.
+// Blocks cross-site requests and DNS rebinding.
 function hasSameOrigin(request: IncomingMessage): boolean {
   const origin = request.headers.origin;
   if (origin === undefined) return true;
   try {
     return new URL(origin).host === request.headers.host;
+  } catch {
+    return false;
+  }
+}
+
+// ---------- Cloudflare Access ----------
+
+let accessKeys = new Map<string, CryptoKey>();
+let accessKeysFetchedAt = 0;
+
+async function refreshAccessKeys() {
+  accessKeysFetchedAt = Date.now();
+  const response = await fetch(`https://${ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`);
+  if (!response.ok) throw new Error(`Cloudflare Access keys: ${response.status}`);
+  const { keys } = (await response.json()) as { keys: Array<JsonWebKey & { kid: string }> };
+  const imported = await Promise.all(
+    keys.map(async (key) => {
+      const algorithm = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
+      return [key.kid, await crypto.subtle.importKey("jwk", key, algorithm, false, ["verify"])] as const;
+    }),
+  );
+  accessKeys = new Map(imported);
+}
+
+// Cloudflare rotates its signing keys; an unknown kid triggers at most one refetch a minute.
+async function accessKey(kid: string): Promise<CryptoKey | undefined> {
+  if (!accessKeys.has(kid) && Date.now() - accessKeysFetchedAt > ACCESS_KEYS_MIN_REFRESH_MS) {
+    await refreshAccessKeys();
+  }
+  return accessKeys.get(kid);
+}
+
+function decodeJwtPart(part: string) {
+  return JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
+}
+
+// Cloudflare Access signs every request it lets through. Checking that signature keeps the
+// bridge closed if the Access app is removed or someone reaches the port directly.
+async function hasValidAccessToken(request: IncomingMessage): Promise<boolean> {
+  const token = request.headers["cf-access-jwt-assertion"];
+  if (typeof token !== "string") return false;
+  const [header, payload, signature] = token.split(".");
+  if (!header || !payload || !signature) return false;
+  try {
+    const { alg, kid } = decodeJwtPart(header);
+    if (alg !== "RS256" || typeof kid !== "string") return false;
+    const key = await accessKey(kid);
+    if (key === undefined) return false;
+    const signed = Buffer.from(`${header}.${payload}`);
+    if (!(await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, Buffer.from(signature, "base64url"), signed))) {
+      return false;
+    }
+    const claims = decodeJwtPart(payload);
+    const audiences: Array<unknown> = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+    const now = Date.now() / 1000;
+    return (
+      audiences.includes(ACCESS_AUD) &&
+      claims.iss === `https://${ACCESS_TEAM_DOMAIN}` &&
+      typeof claims.exp === "number" &&
+      claims.exp > now
+    );
   } catch {
     return false;
   }
@@ -284,12 +349,20 @@ async function handlePoll(request: IncomingMessage, response: ServerResponse, ur
 
 // ---------- server ----------
 
-function serve() {
+async function serve() {
   const sessionCookie = readSessionCookie();
+  if ((ACCESS_TEAM_DOMAIN === undefined) !== (ACCESS_AUD === undefined)) {
+    console.error("Set both CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD, or neither.");
+    process.exit(1);
+  }
+  if (ACCESS_AUD !== undefined) await refreshAccessKeys();
   const server = createServer(async (request, response) => {
     try {
       if (!isAllowedHost(request)) return json(response, 421, { code: "host_not_allowed" });
       if (!hasSameOrigin(request)) return json(response, 403, { code: "cross_origin" });
+      if (ACCESS_AUD !== undefined && !(await hasValidAccessToken(request))) {
+        return json(response, 403, { code: "cloudflare_access_required" });
+      }
       const url = new URL(request.url ?? "/", "http://bridge");
       if (url.pathname === POLL_PATH || url.pathname.startsWith(`${POLL_PATH}/`)) {
         return await handlePoll(request, response, url, sessionCookie);
@@ -307,6 +380,8 @@ function serve() {
   server.listen(PORT, "127.0.0.1", () => {
     console.log(`[bridge] http://127.0.0.1:${PORT} → ${UPSTREAM.origin}`);
     if (PUBLIC_HOSTS.size > 0) console.log(`[bridge] public hosts: ${[...PUBLIC_HOSTS].join(", ")}`);
+    if (ACCESS_AUD !== undefined) console.log(`[bridge] requires Cloudflare Access (${ACCESS_TEAM_DOMAIN})`);
+    else console.warn("[bridge] no Cloudflare Access check: anyone who reaches this port gets T3 Code");
   });
 }
 
@@ -318,5 +393,5 @@ if (command === "pair") {
   }
   await pair(argument);
 } else {
-  serve();
+  await serve();
 }

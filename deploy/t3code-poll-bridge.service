@@ -7,6 +7,8 @@ WorkingDirectory=%h/t3code-poll-bridge
 Environment=T3_UPSTREAM=http://127.0.0.1:3773
 Environment=PORT=3781
 Environment=PUBLIC_HOSTS=t3.example.com
+Environment=CF_ACCESS_TEAM_DOMAIN=<team>.cloudflareaccess.com
+Environment=CF_ACCESS_AUD=<application audience tag>
 ExecStart=/usr/bin/env node bridge.ts
 Restart=always
 RestartSec=3
